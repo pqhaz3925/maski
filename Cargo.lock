@@ -632,6 +632,7 @@ dependencies = [
  "quinn",
  "quinn-proto",
  "rcgen",
+ "ring",
  "rustls",
  "serde",
  "serde_json",

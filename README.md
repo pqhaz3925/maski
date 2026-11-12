@@ -119,6 +119,8 @@ maski server --listen 0.0.0.0:8445 --tun maski0 --addr 10.90.0.1/24 --mtu 1400 \
 
 On start the server creates a certificate in `cert/` and logs a line `certificate sha256 …`; that is the fingerprint for the client. Internet access is set up separately: `net.ipv4.ip_forward=1` and masquerade for the tunnel subnet.
 
+Next to the certificate the server also keeps `cert/quic-keys` (the QUIC stateless-reset and connection-ID keys, mode 600). Keep it with the certificate: a restarted server then tells clients at once that their connection is gone, and they reconnect in about half a second instead of waiting for their 30 s idle timeout.
+
 **Client** (as root, it creates the TUN device):
 
 ```bash

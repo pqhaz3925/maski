@@ -98,7 +98,13 @@ pub async fn run(o: ServerOpts) -> Result<()> {
     sc.migration(true);
     let sock = net::udp_socket(o.listen, None, o.tuning.sockbuf)?;
     let sock_stats = Arc::new(net::SockStats::default());
-    let ep = quinn::Endpoint::new_with_abstract_socket(crate::net::endpoint_config(), Some(sc),
+    // Reset and CID keys that survive a restart (see tls::load_or_create_endpoint_keys).
+    let mut ec = crate::net::endpoint_config();
+    let (rk, ck, new) = crate::tls::load_or_create_endpoint_keys(&o.cert_dir)?;
+    ec.reset_key(Arc::new(ring::hmac::Key::new(ring::hmac::HMAC_SHA256, &rk)));
+    ec.cid_generator(move || Box::new(quinn_proto::HashedConnectionIdGenerator::from_key(ck)));
+    tracing::info!("endpoint keys {} {}", if new { "created in" } else { "loaded from" }, o.cert_dir.join("quic-keys").display());
+    let ep = quinn::Endpoint::new_with_abstract_socket(ec, Some(sc),
         net::UdpSock::new(sock, sock_stats.clone())?, Arc::new(quinn::TokioRuntime))?;
     tracing::info!("listening on udp {}", o.listen);
 
@@ -233,8 +239,13 @@ async fn handle(inc: quinn::Incoming, st: Arc<State>, tun: Arc<tun::AsyncDevice>
     let assigned: Arc<Mutex<Option<(u64, Ipv4Addr)>>> = Arc::new(Mutex::new(None));
     {
         let (conn, st, tun, assigned) = (conn.clone(), st.clone(), tun.clone(), assigned.clone());
+        // The reverse direction's load for the rate controller's min RTT expiry.
+        let rs = net::rate_shared(&conn);
         tokio::spawn(async move {
             while let Ok(d) = conn.read_datagram().await {
+                if let Some(r) = &rs {
+                    r.rx_bytes.fetch_add(d.len() as u64, Ordering::Relaxed);
+                }
                 let Some((q, ctx, off)) = proto::parse_datagram(&d) else { continue };
                 let p = &d[off..];
                 let ok = ctx == 0 && p.len() >= 20 && match *assigned.lock().unwrap() {

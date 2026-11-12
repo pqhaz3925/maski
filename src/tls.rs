@@ -67,6 +67,39 @@ pub fn load_or_create(dir: &std::path::Path, name: &str)
     Ok((cert, key))
 }
 
+/// The server endpoint's stateless-reset key (64 bytes) and connection-ID hash key (8 bytes),
+/// kept in `dir/quic-keys` (mode 600, created on first use) so that they survive a restart.
+///
+/// quinn draws both at random per process. A restarted server then finds the CIDs of its old
+/// connections invalid ("dropping packet with invalid CID") and answers nothing; the client
+/// cannot tell that from a dead path and keeps re-hopping until its idle timeout (30 s; measured
+/// 25 s of no traffic after a 5 s restart). With the same keys the new process answers each such
+/// packet with a stateless reset carrying the token the old process issued for that CID, the
+/// client's QUIC closes at once and the client reconnects.
+#[cfg(feature = "cli")]
+pub fn load_or_create_endpoint_keys(dir: &std::path::Path) -> Result<([u8; 64], u64, bool)> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    let p = dir.join("quic-keys");
+    if let Ok(b) = std::fs::read(&p) {
+        if b.len() == 72 {
+            let mut rk = [0u8; 64];
+            rk.copy_from_slice(&b[..64]);
+            return Ok((rk, u64::from_le_bytes(b[64..72].try_into().unwrap()), false));
+        }
+        anyhow::bail!("{}: expected 72 bytes, found {}", p.display(), b.len());
+    }
+    std::fs::create_dir_all(dir)?;
+    let mut b = [0u8; 72];
+    provider().secure_random.fill(&mut b).map_err(|_| anyhow::anyhow!("no randomness"))?;
+    let mut f = std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(&p)?;
+    f.write_all(&b)?;
+    f.sync_all()?;
+    let mut rk = [0u8; 64];
+    rk.copy_from_slice(&b[..64]);
+    Ok((rk, u64::from_le_bytes(b[64..72].try_into().unwrap()), true))
+}
+
 pub fn fingerprint(cert: &[u8]) -> String {
     hex::encode(Sha256::digest(cert))
 }

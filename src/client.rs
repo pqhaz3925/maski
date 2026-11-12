@@ -54,6 +54,9 @@ pub struct ClientOpts {
     pub primer: bool,
     /// Interfaces to fall back to when the pinned one is dead (`Handle::set_alternates`).
     pub alternates: Vec<String>,
+    /// `migrate` mode: after this long with nothing received and moves done, also race fresh
+    /// connections while the old one keeps its chance (`Client::race`; 0 = off).
+    pub race_ms: u64,
 }
 
 /// Where packets from the server go.
@@ -96,6 +99,10 @@ struct Counters {
     returns: AtomicU64,
     probes: AtomicU64,
     probe_fails: AtomicU64,
+    /// Reconnect races started while the old connection was kept (`Client::race`), and those
+    /// abandoned because it came back.
+    races: AtomicU64,
+    race_aborts: AtomicU64,
 }
 
 /// First wait before probing the preferred interface after a fallback; doubles after every failed
@@ -151,6 +158,9 @@ struct Client {
     out: Mutex<Option<PacketOut>>,
     addr: Mutex<Option<Ipv4Addr>>,
     recovering: AtomicBool,
+    /// The running reconnect is a race next to a still-open connection: the detector keeps
+    /// moving that one meanwhile.
+    racing: AtomicBool,
     gen: AtomicU64,
     c: Counters,
     stopped: AtomicBool,
@@ -404,8 +414,10 @@ impl Client {
     /// log 2026-11-11 14:58), and a growing allowance (`b16ba69`) left the attempt in flight when an
     /// outage ended waiting for quinn's Initial retransmission instead of starting fresh (~0.8 s
     /// slower in the lab at 60 ms RTT).
-    async fn establish(self: &Arc<Self>, want: Option<Ipv4Addr>, max_attempts: Option<u32>, what: &str) -> Result<(Arc<Active>, Ipv4Addr, u32)> {
+    async fn establish(self: &Arc<Self>, want: Option<Ipv4Addr>, max_attempts: Option<u32>, what: &str,
+        guard: Option<&Guard>) -> Result<(Arc<Active>, Ipv4Addr, u32)> {
         let t0 = Instant::now();
+        let mut check = tokio::time::interval(Duration::from_millis(100));
         let every = Duration::from_millis(self.o.attempt_ms.max(100));
         let life = (every * ATTEMPT_LIFE).max(Duration::from_millis(ATTEMPT_LIFE_MIN_MS));
         let mut set: tokio::task::JoinSet<(u32, Result<Hs>)> = tokio::task::JoinSet::new();
@@ -416,9 +428,30 @@ impl Client {
             if self.stopped.load(Ordering::Relaxed) {
                 bail!("stopped");
             }
+            if guard.is_some_and(|g| g.revived()) {
+                return Err(self.race_lost(what, &mut ready, &mut set));
+            }
             // One request at a time: the oldest completed handshake first.
             if let Some((n, hs)) = ready.pop_front() {
                 let rtt = hs.conn.rtt();
+                // A race next to an open connection: a fresh handshake got through, so the path
+                // works now; give the old connection one more move and a round trip or two to
+                // answer before its address is taken over (the server re-points the address to
+                // the newest request and closes the older connection).
+                if let Some(g) = guard.filter(|g| g.old.conn.close_reason().is_none()) {
+                    if let Err(e) = self.migrate("race: a fresh handshake got through, last chance for the old connection") {
+                        tracing::warn!("migrate failed: {e:#}");
+                    }
+                    let wait = (rtt * 2 + Duration::from_millis(100)).clamp(Duration::from_millis(300), Duration::from_millis(1500));
+                    let until = tokio::time::Instant::now() + wait;
+                    while tokio::time::Instant::now() < until && !g.revived() && g.old.conn.close_reason().is_none() {
+                        tokio::time::sleep(Duration::from_millis(20)).await;
+                    }
+                    if g.revived() {
+                        ready.push_front((n, hs));
+                        return Err(self.race_lost(what, &mut ready, &mut set));
+                    }
+                }
                 let limit = (rtt * 4 + Duration::from_millis(500)).clamp(every, every * 3);
                 let t_quic = hs.t_quic;
                 let conn = hs.conn.clone();
@@ -428,6 +461,7 @@ impl Client {
                     let can_start = max_attempts.is_none_or(|m| started < m);
                     tokio::select! {
                         r = &mut sess => break r,
+                        _ = check.tick(), if guard.is_some() => {}
                         _ = tokio::time::sleep_until(next_start), if can_start => {
                             started += 1;
                             next_start = tokio::time::Instant::now() + every;
@@ -472,8 +506,22 @@ impl Client {
                     Ok((k, Err(e))) => tracing::info!("{what} attempt {k} failed after {:?}: {e:#}", t0.elapsed()),
                     Err(_) => {}
                 },
+                _ = check.tick(), if guard.is_some() => {}
             }
         }
+    }
+
+    /// The old connection answered during a race: drop the fresh handshakes (no request was sent
+    /// on them, so the server's address assignment is untouched).
+    fn race_lost(&self, what: &str, ready: &mut std::collections::VecDeque<(u32, Hs)>,
+        set: &mut tokio::task::JoinSet<(u32, Result<Hs>)>) -> anyhow::Error {
+        for (_, h) in ready.drain(..) {
+            h.conn.close(0u32.into(), b"old connection came back");
+        }
+        set.abort_all();
+        self.c.race_aborts.fetch_add(1, Ordering::Relaxed);
+        tracing::info!("{what}: the old connection answered again, race abandoned");
+        anyhow::anyhow!("old connection came back")
     }
 
     fn start_attempt(self: &Arc<Self>, set: &mut tokio::task::JoinSet<(u32, Result<Hs>)>, n: u32, life: Duration) {
@@ -559,6 +607,8 @@ impl Client {
         {
             let (conn, me) = (conn.clone(), self.clone());
             let q = sid / 4;
+            // The reverse direction's load for the rate controller's min RTT expiry.
+            let rs = net::rate_shared(&conn);
             tokio::spawn(async move {
                 let mut batch: Vec<Bytes> = Vec::with_capacity(BATCH);
                 while let Ok(d) = conn.read_datagram().await {
@@ -568,6 +618,9 @@ impl Client {
                             Some(Ok(d)) => batch.push(d),
                             _ => break,
                         }
+                    }
+                    if let Some(r) = &rs {
+                        r.rx_bytes.fetch_add(batch.iter().map(|d| d.len() as u64).sum(), Ordering::Relaxed);
                     }
                     me.deliver(q, &batch).await;
                     batch.clear();
@@ -631,15 +684,39 @@ impl Client {
             return;
         }
         let me = self.clone();
-        tokio::spawn(async move { me.reconnect(why).await });
+        tokio::spawn(async move { me.reconnect(why, None).await });
+    }
+
+    /// A reconnect race next to the current connection, which stays in use (and keeps being
+    /// moved by the detector) until a new session is up; abandoned if it answers again first.
+    ///
+    /// Why: when the server restarts it has no state for the connection. Without the server's old
+    /// keys (`tls::load_or_create_endpoint_keys`: an older server binary, a lost key file) it
+    /// drops our packets without a word, which looks exactly like a dead radio path, so `migrate`
+    /// re-hopped until the 30 s idle timeout (measured: traffic back 25.3 s after a 5 s restart).
+    /// A plain outage must still end in a migration that keeps the server's session, held
+    /// packets and all: so the request on a fresh connection is only sent while the old one has
+    /// heard nothing since the race began, and only after one more move of it has gone
+    /// unanswered (see `establish`).
+    fn race(self: &Arc<Self>, why: String) {
+        let Some(old) = self.active() else { return };
+        if self.recovering.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        self.racing.store(true, Ordering::Release);
+        let n = self.c.races.fetch_add(1, Ordering::Relaxed) + 1;
+        tracing::info!("RACE #{n} start ({why})");
+        let g = Guard { base: auth_rx(&old.conn), old };
+        let me = self.clone();
+        tokio::spawn(async move { me.reconnect(why, Some(g)).await });
     }
 
     /// Replace the connection (`establish`: racing handshakes, one request at a time).
-    async fn reconnect(self: &Arc<Self>, why: String) {
+    async fn reconnect(self: &Arc<Self>, why: String, guard: Option<Guard>) {
         let t0 = Instant::now();
         let want = *self.addr.lock().unwrap();
         tracing::info!("RECONNECT start ({why})");
-        match self.establish(want, None, "RECONNECT").await {
+        match self.establish(want, None, "RECONNECT", guard.as_ref()).await {
             Ok((act, ip, attempts)) => {
                 if Some(ip) != want {
                     tracing::warn!("server assigned {ip} instead of {want:?}: inner flows will break");
@@ -654,6 +731,7 @@ impl Client {
             Err(e) => tracing::info!("RECONNECT ended: {e:#}"),
         }
         self.last_action.store(self.now_ms(), Ordering::Relaxed);
+        self.racing.store(false, Ordering::Release);
         self.recovering.store(false, Ordering::Release);
     }
 
@@ -744,7 +822,8 @@ impl Client {
                 remigrate_at = None;
                 skip_rehop = false;
             }
-            if self.recovering.load(Ordering::Acquire) {
+            // A race (`Client::race`) keeps the old connection: keep moving it meanwhile.
+            if self.recovering.load(Ordering::Acquire) && !self.racing.load(Ordering::Acquire) {
                 continue;
             }
             // A connection that is already closed (idle timeout after a long outage or a device
@@ -791,6 +870,11 @@ impl Client {
             }
             let gap = (self.o.dead_ms << k.min(6)).min(self.o.dead_ms.max(1000));
             let since_act = now.saturating_sub(last_act);
+            // Moves have not helped for race_ms: maybe the server lost the connection (restart).
+            if k >= 1 && self.o.race_ms > 0 && self.o.recover == "migrate" && silent >= self.o.race_ms
+                && !self.recovering.load(Ordering::Acquire) {
+                self.race(format!("path silent {silent} ms after {k} action(s)"));
+            }
             // 2. The first action: silence past dead_ms, or past `fast` while sending.
             if k == 0 {
                 // The fast check only on a settled socket: right after a move the RTT estimate is the
@@ -1129,9 +1213,10 @@ impl Handle {
 
     pub fn stats_line(&self) -> String {
         match self.c.active() {
-            Some(a) => format!("STATS gen={} {} accepted={} queue_drops={} migrations={} reconnects={} too_large_drops={} {}", a.gen,
+            Some(a) => format!("STATS gen={} {} accepted={} queue_drops={} migrations={} reconnects={} races={} race_aborts={} too_large_drops={} {}", a.gen,
                 net::stats_line(&a.conn), self.c.c.tx_pkts.load(Ordering::Relaxed), self.c.c.queue_drops.load(Ordering::Relaxed),
                 self.c.c.migrations.load(Ordering::Relaxed), self.c.c.reconnects.load(Ordering::Relaxed),
+                self.c.c.races.load(Ordering::Relaxed), self.c.c.race_aborts.load(Ordering::Relaxed),
                 self.c.c.too_large.load(Ordering::Relaxed), self.c.sock.line()),
             None => "STATS not connected".into(),
         }
@@ -1175,7 +1260,7 @@ pub async fn start(o: ClientOpts) -> Result<Handle> {
     let me = Arc::new(Client {
         cc, auth, epoch: Instant::now(), last_rx: Arc::new(AtomicU64::new(0)), last_action: AtomicU64::new(0), bind,
         interface: Mutex::new(o.interface.clone()), cur: Mutex::new(None), out: Mutex::new(None), addr: Mutex::new(None),
-        recovering: AtomicBool::new(false), gen: AtomicU64::new(0), c: Counters::default(), stopped: AtomicBool::new(false),
+        recovering: AtomicBool::new(false), racing: AtomicBool::new(false), gen: AtomicU64::new(0), c: Counters::default(), stopped: AtomicBool::new(false),
         reset: AtomicBool::new(false), first: Mutex::new((0, 0)), sock: Default::default(),
         preferred: Mutex::new(o.interface.clone()), alternates: Mutex::new(o.alternates.clone()), fb: Default::default(),
         holes: Default::default(), socks: Default::default(), tx_wait: AtomicU64::new(0), wake_at: AtomicU64::new(0),
@@ -1185,7 +1270,7 @@ pub async fn start(o: ClientOpts) -> Result<Handle> {
     // The first connection, like every reconnect, retries on a fresh socket. (The mobile
     // operator's "3 packets, then nothing" kill of fresh flows is avoided by the DCID choice, see
     // net::DcidMode; this retry is for ordinary loss.)
-    let (act, addr, attempt) = me.establish(None, Some(me.o.first_attempts.max(1)), "CONNECT").await?;
+    let (act, addr, attempt) = me.establish(None, Some(me.o.first_attempts.max(1)), "CONNECT", None).await?;
     *me.cur.lock().unwrap() = Some(act);
     *me.addr.lock().unwrap() = Some(addr);
     *me.first.lock().unwrap() = (attempt, t0.elapsed().as_millis() as u64);
@@ -1234,6 +1319,25 @@ fn log_capsule(t: u64, p: &[u8]) {
 /// every `attempt_ms`), at least `ATTEMPT_LIFE_MIN_MS`.
 const ATTEMPT_LIFE: u32 = 4;
 const ATTEMPT_LIFE_MIN_MS: u64 = 4000;
+
+/// The connection a race runs next to, and its authenticated receive count when the race began.
+struct Guard {
+    old: Arc<Active>,
+    base: u64,
+}
+
+impl Guard {
+    /// The old connection received something it could decrypt since the race began.
+    fn revived(&self) -> bool {
+        self.old.conn.close_reason().is_none() && auth_rx(&self.old.conn) > self.base
+    }
+}
+
+/// Frames received on `c` (only packets that decrypted count; a stray datagram does not).
+fn auth_rx(c: &quinn::Connection) -> u64 {
+    let f = c.stats().frame_rx;
+    f.acks + f.datagram + f.ping + f.stream + f.path_challenge + f.path_response + f.new_connection_id + f.max_data + f.max_stream_data
+}
 
 /// A completed QUIC handshake, before the CONNECT-IP request.
 struct Hs {

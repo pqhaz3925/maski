@@ -305,6 +305,12 @@ pub struct RateShared {
     pub moved: AtomicU64,
     /// In-flight bytes + 1 when the window was first asked for after the latest move; 0 = not yet.
     pub move_base: AtomicU64,
+    /// Bytes of datagrams received from the peer (fed by the owner): the reverse direction's
+    /// load, which decides whether an RTT sample can carry the peer's standing queue (`Rate`).
+    pub rx_bytes: AtomicU64,
+    /// Min RTT re-measurements (drains) done, and how many of them raised the min RTT.
+    pub drains: AtomicU64,
+    pub raises: AtomicU64,
 }
 
 impl RateShared {
@@ -329,8 +335,34 @@ impl RateShared {
 /// Rate: acked bytes over the last max(min RTT, 10 ms), max-filtered over clamp(10 x min RTT,
 /// 0.5 s, 2 s); samples taken while app-limited only raise it, and the filter does not age while
 /// app-limited. With `gain` 2 the window doubles every round trip until the path is full (no
-/// separate startup). Min RTT: per-packet ack time minus send time, minimum since the connection
-/// started or the last network change.
+/// separate startup). Min RTT: per-packet ack time minus send time, the minimum since it was last
+/// confirmed (see below), the connection started or the last network change.
+///
+/// Min RTT expiry. The window is gain x rate x min RTT, so a min RTT that is too small for the path
+/// (its RTT grew after the connect: a route change, LTE -> 3G behind a modem's NAT, a silent re-hop
+/// to a slower path) shrinks the window below the path's BDP; the delivery rate then falls with it,
+/// round after round, down to the 16-packet floor (lab: 20 -> 80 ms after connect gave 2 Mbit/s on
+/// a 30 Mbit/s line). Under load every sample carries the standing queue (about one BDP), so a
+/// plain sliding minimum would take that queue for path RTT and grow the window with every window
+/// (on a deep-buffered weak uplink: unbounded queue). Instead (per ACK frame, `frame_end`):
+/// - a frame whose smallest sample is within `near(min)` (25 % + 2 ms, at least 27 ms; a frame for
+///   a single packet, which the peer acknowledged on its ACK timer, 15 ms more) confirms the min;
+/// - min RTT raises come only from samples without a queue of ours: packets sent with no more
+///   than `quiet_cap` (a quarter of the BDP by the average rate, at least 4 packets) in flight.
+///   Dense frames of such packets (light traffic) that all stay above `near(min)` for 2 s set the
+///   min to their smallest sample; sparse ones (idle keepalives) to their smallest less 10 ms;
+/// - a drain makes such samples under load: the window drops to `quiet_cap` until in flight is
+///   below it, and the dense frames of packets sent after that give the path's RTT. It runs after
+///   `expire` (10 s) without a confirming sample, or early: when dense frames have stayed above
+///   `gain x 1.25 x min + 10 ms` (more than our own standing queue explains) for 2 RTTs, or when
+///   startup ended on a round that far above. Early drains that find nothing back off 1, 2, 4 s;
+///   one costs about a round at a quarter of the rate;
+/// - nothing raises the min RTT while the peer sends more than an eighth of what we deliver
+///   (`RateShared::rx_bytes`): its standing queue sits on our ACK path and would be taken for
+///   path RTT, and two ends taking each other's queue into their min RTT ratchet both queues up
+///   (lab: upload and download at once, 70 -> 360 ms within 20 s before this rule);
+/// - a raise restarts the startup gain (a new path), a sample below the min lowers it at once,
+///   and a move to a new socket makes a confirmation due within 2 s.
 #[derive(Debug, Clone)]
 pub struct Rate {
     gain: f64,
@@ -373,7 +405,101 @@ pub struct Rate {
     sent_since: u64,
     /// The `shared.moved` count that an ACK has been seen for.
     moved_seen: u64,
+    /// Min RTT expiry (zero = never, the behaviour before expiry existed).
+    expire: Duration,
+    /// When a sample last confirmed the min RTT (within `near(min)`), and the peer's received
+    /// bytes at that moment.
+    min_at: Option<Instant>,
+    rx_at_min: u64,
+    acked_at_min: u64,
+    /// (time, acked) about every 100 ms over the last second (`avg_rate`), and that rate as of
+    /// the last ACK frame.
+    slow: std::collections::VecDeque<(Instant, u64)>,
+    qrate: u64,
+    /// The previous ACK frame (the expiry clock stops while none arrive).
+    last_frame: Option<Instant>,
+    /// Quiet samples (see `Rate`) since `min_at`: their minimum and count.
+    quiet_min: Duration,
+    quiet_n: u32,
+    /// The same for sparse quiet samples (one packet per ACK frame: keepalives on an idle
+    /// connection, acknowledged on the peer's ACK timer).
+    sparse_min: Duration,
+    sparse_n: u32,
+    /// Send time and in-flight bytes (before it) of each packet in flight, oldest first.
+    sent_q: std::collections::VecDeque<(Instant, u64)>,
+    drain: Option<Drain>,
+    /// The ACK frame being processed (`on_ack` calls up to `on_end_acks`): packets, smallest
+    /// sample, all of them quiet; packets and smallest sample that count for a drain.
+    fr_n: u32,
+    fr_min: Duration,
+    fr_quiet: bool,
+    fr_dn: u32,
+    fr_dmin: Duration,
+    /// The last frame was dense (two packets or more).
+    fr_dense: bool,
+    /// Since when every dense frame's smallest sample was above `gain x 1.25 x min + 10 ms` (no
+    /// queue of ours explains that: the min RTT is likely too small), and their packets.
+    hi_since: Option<Instant>,
+    hi_n: u32,
+    /// Early drains (on `hi_since`) back off while they find nothing: gap and next allowed time.
+    early_gap: Duration,
+    next_early: Option<Instant>,
     pub shared: Arc<RateShared>,
+}
+
+/// A min RTT re-measurement (see `Rate`).
+#[derive(Debug, Clone)]
+struct Drain {
+    start: Instant,
+    /// Window during the drain.
+    cap: u64,
+    /// When in-flight first fell to `cap`; only packets sent after it count.
+    reached: Option<Instant>,
+    best: Duration,
+    n: u32,
+    rx0: u64,
+    acked0: u64,
+}
+
+/// Min RTT expiry when nothing confirms it (BBR uses the same 10 s).
+const MIN_RTT_EXPIRE: Duration = Duration::from_secs(10);
+/// Quiet samples above `near(min)` for this long (at least `4 x min`) and at least
+/// `QUIET_MIN_SAMPLES` of them set the min RTT.
+const QUIET_EXPIRE: Duration = Duration::from_secs(2);
+const QUIET_MIN_SAMPLES: u32 = 4;
+/// A move to a new socket may be a move to a different path: the min RTT must be confirmed
+/// within this long after it, or a drain re-measures it.
+const MOVE_RECHECK: Duration = Duration::from_secs(2);
+/// The peer's ACK delay that a sample of a dense ACK frame may still carry (quinn's default
+/// max_ack_delay; a frame for several packets is mostly sent before its timer).
+const ACK_SLACK: Duration = Duration::from_millis(25);
+/// A sparse sample (an ACK frame for one packet: a keepalive, acknowledged when the peer's ACK
+/// timer fires) confirms the min RTT up to this much more: measured 29-36 ms of delay on idle
+/// keepalives in the lab. Sparse samples never raise the min RTT.
+const SPARSE_EXTRA: Duration = Duration::from_millis(15);
+/// Taken off the smallest sparse sample when it re-measures the path (see `expiry`). Subtracting
+/// the whole ACK_SLACK made it 15 ms short on a 20 -> 80 ms step (one sample had 10 ms of delay),
+/// and the startup gain over 65 ms then grew the window only as fast as the inner slow start.
+const SPARSE_DEDUCT: Duration = Duration::from_millis(10);
+/// Dense frames above the queue line for this long (at least 2 x the latest RTT) and this many
+/// packets start a drain before `expire`.
+const EARLY_AFTER: Duration = Duration::from_millis(150);
+const EARLY_MIN_PKTS: u32 = 8;
+const EARLY_GAP_MIN: Duration = Duration::from_secs(1);
+/// Early drains that find the min RTT right back off 1, 2, 4 s. They do fire on a stable path
+/// when the rate estimate runs high (ACK compression: our own queue then passes the line); a
+/// longer gap would delay the reaction to a real step by as much.
+const EARLY_GAP_MAX: Duration = Duration::from_secs(4);
+/// The peer's data rate (bytes/s) below which the reverse path is taken to hold no queue of
+/// the peer's: at most this, or an eighth of our own rate.
+const RX_QUIET_FLOOR: u64 = 25_000;
+/// A drain without a usable sample ends after this (at least 4 x the latest RTT).
+const DRAIN_MAX: Duration = Duration::from_secs(2);
+
+/// Samples up to this confirm `min`; above it they say the path got slower (25 % + 2 ms, but at
+/// least `ACK_SLACK` + 2 ms above `min`).
+fn near(min: Duration) -> Duration {
+    (min * 5 / 4 + Duration::from_millis(2)).max(min + ACK_SLACK + Duration::from_millis(2))
 }
 
 const RATE_FLOOR_PKTS: u64 = 16;
@@ -396,13 +522,16 @@ const STARTUP_GAIN: f64 = 2.5;
 const MOVE_ALLOW_PKTS: u64 = 4;
 
 impl Rate {
-    fn new(gain: f64, startup_gain: f64, mode: u8, mtu: u16) -> Self {
+    fn new(gain: f64, startup_gain: f64, mode: u8, expire: Duration, mtu: u16) -> Self {
         let mtu = mtu as u64;
         let init = RATE_INIT_PKTS * mtu;
         let s = Self { gain, startup_gain, mtu, init, window: init, acked: 0, batch: 0, hist: Default::default(), maxf: Default::default(),
             min_rtt: None, reset_seen: 0, startup: true, full_bw: 0, full_cnt: 0, round_end: None, last_rtt: Duration::ZERO,
             round_min_rtt: Duration::MAX, round_samples: 0, plat_samples: 0, qround_end: None, mode,
             tr_acks: 0, tr_limited: 0, tr_max_rtt: Duration::ZERO, tr_at: None, infl: 0, sent_since: 0, moved_seen: 0,
+            expire, min_at: None, rx_at_min: 0, acked_at_min: 0, slow: Default::default(), qrate: 0, last_frame: None, quiet_min: Duration::MAX, quiet_n: 0, sparse_min: Duration::MAX, sparse_n: 0, sent_q: Default::default(), drain: None,
+            fr_n: 0, fr_min: Duration::MAX, fr_quiet: true, fr_dn: 0, fr_dmin: Duration::MAX, fr_dense: false, hi_since: None, hi_n: 0,
+            early_gap: EARLY_GAP_MIN, next_early: None,
             shared: Default::default() };
         s.shared.window.store(init, Ordering::Relaxed);
         s
@@ -423,11 +552,211 @@ impl Rate {
             self.round_min_rtt = Duration::MAX;
             self.round_samples = 0;
             self.qround_end = None;
+            self.min_at = None;
+            self.quiet_min = Duration::MAX;
+            self.quiet_n = 0;
+            self.drain = None;
+            self.hi_since = None;
+            self.hi_n = 0;
+            self.early_gap = EARLY_GAP_MIN;
+            self.next_early = None;
         }
     }
 
     pub fn bw(&self) -> u64 {
         self.maxf.front().map_or(0, |x| x.1)
+    }
+
+    /// Acked bytes per second over the last second or so (not max-filtered: ACK compression
+    /// inflates `bw`, measured 5x on an 8 Mbit/s downlink with the uplink loaded too). Falls back
+    /// to `bw` before there is a span of 200 ms.
+    fn avg_rate(&self, now: Instant) -> u64 {
+        match self.slow.front() {
+            // Not across a silence (an outage, a pause): that average says nothing about the path.
+            Some(&(t, a)) if now.saturating_duration_since(t) >= Duration::from_millis(200)
+                && now.saturating_duration_since(t) <= Duration::from_millis(1500) =>
+                ((self.acked - a) as f64 / now.saturating_duration_since(t).as_secs_f64()) as u64,
+            _ => self.bw(),
+        }
+    }
+
+    /// In-flight bytes that cannot build a queue of ours worth mentioning: a quarter of the
+    /// estimated BDP (by the smaller of the max-filtered and the average rate), at least 4 packets.
+    fn quiet_cap(&self, min: Duration) -> u64 {
+        ((self.bw().min(self.qrate) as f64 * min.as_secs_f64() / 4.0) as u64).max(4 * self.mtu)
+    }
+
+    /// The min RTT was confirmed (or re-measured) now.
+    fn confirm(&mut self, now: Instant) {
+        self.min_at = Some(now);
+        self.acked_at_min = self.acked;
+        self.rx_at_min = self.shared.rx_bytes.load(Ordering::Relaxed);
+        self.quiet_min = Duration::MAX;
+        self.quiet_n = 0;
+        self.sparse_min = Duration::MAX;
+        self.sparse_n = 0;
+    }
+
+    /// Did the peer send little enough between `rx0` and now (`span`), compared with what we
+    /// delivered (`acked0` on), that the reverse path holds no queue of its own? Its standing
+    /// queue would be in every RTT sample. A one-way transfer's reverse traffic is the inner
+    /// ACKs, a few % of it.
+    fn rx_quiet(&self, rx0: u64, acked0: u64, span: Duration) -> bool {
+        let secs = span.as_secs_f64().max(1e-3);
+        let rx = self.shared.rx_bytes.load(Ordering::Relaxed).saturating_sub(rx0) as f64 / secs;
+        let own = self.acked.saturating_sub(acked0) as f64 / secs;
+        let q = rx <= (own / 8.0).max(RX_QUIET_FLOOR as f64);
+        tracing::debug!(target: "maski::rate", "reverse {rx:.0} B/s, own {own:.0} B/s over {span:?}: quiet {q}");
+        q
+    }
+
+    /// A re-measured path RTT `cand` (from quiet samples or a drain): raise the min RTT to it when
+    /// it is clearly above, and the reverse path was quiet; confirm the old one otherwise.
+    fn remeasured(&mut self, now: Instant, cand: Duration, quiet: bool, how: &str) {
+        let Some(min) = self.min_rtt else { return };
+        if cand > near(min) && quiet {
+            self.min_rtt = Some(cand);
+            self.shared.raises.fetch_add(1, Ordering::Relaxed);
+            // A different path: ramp up as on a fresh connection (startup gain), not with the
+            // steady gain behind the inner flows' slow start (that made the gate drop from it).
+            self.startup = true;
+            self.full_bw = 0;
+            self.full_cnt = 0;
+            self.round_end = None;
+            self.qround_end = None;
+            self.round_min_rtt = Duration::MAX;
+            self.round_samples = 0;
+            tracing::info!(target: "maski::rate", "min rtt {:.1} -> {:.1} ms ({how})", min.as_secs_f64() * 1e3, cand.as_secs_f64() * 1e3);
+            self.early_gap = EARLY_GAP_MIN;
+        } else {
+            tracing::debug!(target: "maski::rate", "min rtt {:.1} ms kept ({how}: {:.1} ms, reverse quiet {quiet})",
+                min.as_secs_f64() * 1e3, cand.as_secs_f64() * 1e3);
+            self.early_gap = (self.early_gap * 2).min(EARLY_GAP_MAX);
+        }
+        self.next_early = Some(now + self.early_gap);
+        self.hi_since = None;
+        self.hi_n = 0;
+        self.confirm(now);
+    }
+
+    /// End of an ACK frame: its smallest sample confirms the min RTT, or counts as quiet, as above
+    /// the queue line, or for a drain. Only dense frames (two packets or more: sent on the peer's
+    /// ACK threshold, not its timer) count for anything that can raise the min RTT.
+    fn frame_end(&mut self, now: Instant) {
+        let (n, smin, quiet, dn, dmin) = (self.fr_n, self.fr_min, self.fr_quiet, self.fr_dn, self.fr_dmin);
+        self.fr_n = 0;
+        self.fr_min = Duration::MAX;
+        self.fr_quiet = true;
+        self.fr_dn = 0;
+        self.fr_dmin = Duration::MAX;
+        let Some(min) = self.min_rtt else { return };
+        if n == 0 || self.expire.is_zero() {
+            return;
+        }
+        let dense = n >= 2;
+        self.fr_dense = dense;
+        if smin <= near(min) + if dense { Duration::ZERO } else { SPARSE_EXTRA } {
+            self.confirm(now);
+        } else if dense && quiet {
+            self.quiet_min = self.quiet_min.min(smin);
+            self.quiet_n += 1;
+        } else if quiet {
+            self.sparse_min = self.sparse_min.min(smin);
+            self.sparse_n += 1;
+        }
+        if dense {
+            let hi = min.mul_f64(self.gain * 1.25) + Duration::from_millis(10);
+            if smin > hi {
+                self.hi_since.get_or_insert(now);
+                self.hi_n += n;
+            } else {
+                self.hi_since = None;
+                self.hi_n = 0;
+            }
+            if let Some(d) = &mut self.drain {
+                if dn > 0 {
+                    d.best = d.best.min(dmin);
+                    d.n += dn;
+                }
+            }
+        }
+    }
+
+    /// Min RTT expiry, once per ACK frame (see `Rate`).
+    fn expiry(&mut self, now: Instant, in_flight: u64) {
+        let Some(min) = self.min_rtt else { return };
+        if self.expire.is_zero() {
+            return;
+        }
+        if self.min_at.is_none() || (self.startup && self.fr_dense) {
+            // Startup fills the path's queue on purpose: its samples under load say nothing about
+            // the path. (Idle in startup, which a connection stays in until it first carries
+            // load, the quiet rules below still apply.)
+            self.confirm(now);
+            self.hi_since = None;
+            self.hi_n = 0;
+            return;
+        }
+        if let Some(d) = &mut self.drain {
+            if d.reached.is_none() && in_flight <= d.cap {
+                d.reached = Some(now);
+            }
+            let to = DRAIN_MAX.max(self.last_rtt * 4);
+            let done = match d.reached {
+                Some(r) => d.n >= 1 && now >= r + d.best + (d.best / 4).max(Duration::from_millis(10)),
+                None => false,
+            };
+            if done || now.saturating_duration_since(d.start) >= to {
+                let d = self.drain.take().unwrap();
+                if d.n == 0 {
+                    tracing::debug!(target: "maski::rate", "drain: no sample in {:?}", now - d.start);
+                    self.confirm(now);
+                } else {
+                    let quiet = self.rx_quiet(d.rx0, d.acked0, now - d.start);
+                    self.remeasured(now, d.best, quiet, "drain");
+                }
+            }
+            return;
+        }
+        let since = now.saturating_duration_since(self.min_at.unwrap());
+        let early = self.hi_since.is_some_and(|t| now.saturating_duration_since(t) >= EARLY_AFTER.max(self.last_rtt * 2))
+            && self.hi_n >= EARLY_MIN_PKTS && self.next_early.is_none_or(|t| now >= t);
+        let quiet_due = since >= QUIET_EXPIRE.max(min * 4);
+        if quiet_due && self.quiet_n >= QUIET_MIN_SAMPLES {
+            let quiet = self.rx_quiet(self.rx_at_min, self.acked_at_min, since);
+            let cand = self.quiet_min;
+            self.remeasured(now, cand, quiet, "quiet samples");
+        } else if quiet_due && self.sparse_n >= QUIET_MIN_SAMPLES {
+            // Idle: every keepalive came back late. Their smallest sample less SPARSE_DEDUCT as the
+            // path RTT: a keepalive's ACK waits 0-36 ms (0 when it rides on a packet of the
+            // peer's), so this errs either way by tens of ms at most; a dense sample under load
+            // lowers it, and a 25 % error does not shrink the window below the path's BDP.
+            let quiet = self.rx_quiet(self.rx_at_min, self.acked_at_min, since);
+            let cand = self.sparse_min.saturating_sub(SPARSE_DEDUCT);
+            self.remeasured(now, cand, quiet, "sparse samples");
+        } else if self.startup {
+        } else if since >= self.expire || early {
+            // While the peer sends a lot no drain can raise the min RTT (see `rx_quiet`): skip it.
+            // Upload and download at once on a weak link otherwise drained every few seconds on
+            // both ends, cost ~20 % of the download and doubled the gate drops (lab).
+            if !self.rx_quiet(self.rx_at_min, self.acked_at_min, since) {
+                self.confirm(now);
+                self.hi_since = None;
+                self.hi_n = 0;
+                self.next_early = Some(now + EARLY_GAP_MAX);
+                return;
+            }
+            self.start_drain(now, min, in_flight, if early { "early" } else { "expiry" });
+        }
+    }
+
+    fn start_drain(&mut self, now: Instant, min: Duration, in_flight: u64, why: &str) {
+        tracing::debug!(target: "maski::rate", "drain ({why}): min {:.1} ms unconfirmed for {:?}", min.as_secs_f64() * 1e3,
+            self.min_at.map(|t| now.saturating_duration_since(t)));
+        self.shared.drains.fetch_add(1, Ordering::Relaxed);
+        let cap = self.quiet_cap(min);
+        self.drain = Some(Drain { start: now, cap, reached: (in_flight <= cap).then_some(now), best: Duration::MAX, n: 0,
+            rx0: self.shared.rx_bytes.load(Ordering::Relaxed), acked0: self.acked });
     }
 }
 
@@ -441,12 +770,36 @@ impl Controller for Rate {
         self.round_min_rtt = self.round_min_rtt.min(s);
         self.round_samples += 1;
         self.plat_samples += 1;
-        if !s.is_zero() && self.min_rtt.is_none_or(|m| s < m) {
+        // In flight when this packet was sent (packets of one datagram share the send time).
+        while self.sent_q.front().is_some_and(|x| x.0 < sent) {
+            self.sent_q.pop_front();
+        }
+        let infl_at = self.sent_q.front().filter(|x| x.0 == sent).map(|x| x.1);
+        if s.is_zero() {
+            return;
+        }
+        let Some(m) = self.min_rtt else {
+            self.min_rtt = Some(s);
+            return;
+        };
+        // Per ACK frame (see `frame_end`).
+        self.fr_n += 1;
+        self.fr_min = self.fr_min.min(s);
+        self.fr_quiet &= infl_at.is_some_and(|x| x <= self.quiet_cap(m));
+        if self.drain.as_ref().is_some_and(|d| d.reached.is_some_and(|r| sent >= r)) {
+            self.fr_dn += 1;
+            self.fr_dmin = self.fr_dmin.min(s);
+        }
+        if s < m {
             self.min_rtt = Some(s);
         }
     }
 
-    fn on_sent(&mut self, _now: Instant, bytes: u64, _pn: u64) {
+    fn on_sent(&mut self, now: Instant, bytes: u64, _pn: u64) {
+        if self.sent_q.len() >= 1 << 16 {
+            self.sent_q.pop_front();
+        }
+        self.sent_q.push_back((now, self.infl + self.sent_since));
         self.sent_since += bytes;
     }
 
@@ -459,6 +812,12 @@ impl Controller for Rate {
             // An ACK after the move: quinn now declares the old path's packets lost by itself.
             self.moved_seen = m;
             self.shared.move_base.store(0, Ordering::Relaxed);
+            // The new socket may take a different path: re-measure soon unless confirmed.
+            if let Some(t) = self.min_at {
+                if !self.expire.is_zero() {
+                    self.min_at = Some(t.min(now.checked_sub(self.expire.saturating_sub(MOVE_RECHECK)).unwrap_or(t)));
+                }
+            }
         }
         // App-limited = the window was not full when this ACK arrived (in flight before it < window
         // minus two packets). quinn's own flag is useless here: it is false whenever its last poll
@@ -466,7 +825,30 @@ impl Controller for Rate {
         // flow in recovery used to age the estimate down (measured: 27 -> 1.2 Mbit/s between two
         // downloads, window 814 -> 62 KB, the next download then ramped behind the inner slow start).
         let pre = in_flight + std::mem::take(&mut self.batch);
-        let app_limited = pre + 2 * self.mtu < self.window;
+        // A drain limits the window on purpose: its ACKs only raise the rate, as app-limited ones.
+        let app_limited = pre + 2 * self.mtu < self.window || self.drain.is_some();
+        if self.slow.back().is_none_or(|x| now.saturating_duration_since(x.0) >= Duration::from_millis(100)) {
+            self.slow.push_back((now, self.acked));
+            while self.slow.len() > 2 && now.saturating_duration_since(self.slow[1].0) >= Duration::from_secs(1) {
+                self.slow.pop_front();
+            }
+        }
+        self.qrate = self.avg_rate(now);
+        // Nothing came back for a while (an outage, the peer gone quiet): no sample could confirm
+        // the min RTT meanwhile, so that time does not count towards its expiry. Without this a
+        // 10 s outage made the server drain (window 4 packets) right when it flushed the held
+        // packets: at 400 ms RTT one inner download then stalled 55 s instead of ~10 (lab).
+        if let (Some(t), Some(m)) = (self.last_frame, self.min_at) {
+            let gap = now.saturating_duration_since(t);
+            if gap > Duration::from_secs(1) {
+                self.min_at = Some(m + gap);
+                self.hi_since = None;
+                self.hi_n = 0;
+            }
+        }
+        self.last_frame = Some(now);
+        self.frame_end(now);
+        self.expiry(now, in_flight);
         let Some(min_rtt) = self.min_rtt else { return };
         self.hist.push_back((now, self.acked));
         let span = min_rtt.max(Duration::from_millis(10));
@@ -519,6 +901,11 @@ impl Controller for Rate {
             if self.startup && self.qround_end.is_some() && self.round_samples >= RATE_ROUND_MIN_SAMPLES && self.round_min_rtt > round_thr {
                 self.startup = false;
                 tracing::debug!(target: "maski::rate", "startup done at {} B/s: round min rtt {:?} min {min_rtt:?}", self.bw(), self.round_min_rtt);
+                // A startup overshoot raises a round's RTT to 1.5-2 x min; far above the queue
+                // line the path itself got slower (the step-up case, idle before): re-measure now.
+                if !self.expire.is_zero() && self.round_min_rtt > min_rtt.mul_f64(self.gain * 1.25) + Duration::from_millis(10) {
+                    self.start_drain(now, min_rtt, in_flight, "startup ended far above the min");
+                }
             }
             self.round_min_rtt = Duration::MAX;
             self.round_samples = 0;
@@ -551,7 +938,9 @@ impl Controller for Rate {
             tracing::debug!(target: "maski::rate", "bw {old} -> {bw} B/s app_limited={app_limited} in_flight={in_flight} win={} maxf={} hist={}",
                 self.window, self.maxf.len(), self.hist.len());
         }
-        if bw > 0 {
+        if let Some(d) = &self.drain {
+            self.window = d.cap;
+        } else if bw > 0 {
             let gain = if self.startup { self.gain.max(self.startup_gain) } else { self.gain };
             let w = (gain * bw as f64 * min_rtt.as_secs_f64()) as u64;
             self.window = w.max(RATE_FLOOR_PKTS * self.mtu);
@@ -561,9 +950,9 @@ impl Controller for Rate {
             self.tr_limited += u32::from(!app_limited);
             self.tr_max_rtt = self.tr_max_rtt.max(self.last_rtt);
             if self.tr_at.is_none_or(|t| now.saturating_duration_since(t) >= Duration::from_millis(100)) {
-                tracing::debug!(target: "maski::rate_trace", "kbps={} win={} infl={} min_rtt={:.1} rtt={:.1} max_rtt={:.1} acks={} limited={} startup={}",
+                tracing::debug!(target: "maski::rate_trace", "kbps={} win={} infl={} min_rtt={:.1} rtt={:.1} max_rtt={:.1} acks={} limited={} startup={} drain={}",
                     bw * 8 / 1000, self.window, in_flight, min_rtt.as_secs_f64() * 1e3, self.last_rtt.as_secs_f64() * 1e3,
-                    self.tr_max_rtt.as_secs_f64() * 1e3, self.tr_acks, self.tr_limited, self.startup as u8);
+                    self.tr_max_rtt.as_secs_f64() * 1e3, self.tr_acks, self.tr_limited, self.startup as u8, self.drain.is_some() as u8);
                 self.tr_at = Some(now);
                 self.tr_acks = 0;
                 self.tr_limited = 0;
@@ -603,10 +992,10 @@ impl Controller for Rate {
     }
 }
 
-struct RateFactory(f64, f64, u8);
+struct RateFactory(f64, f64, u8, Duration);
 impl ControllerFactory for RateFactory {
     fn build(self: Arc<Self>, _: Instant, mtu: u16) -> Box<dyn Controller> {
-        Box::new(Rate::new(self.0, self.1, self.2, mtu))
+        Box::new(Rate::new(self.0, self.1, self.2, self.3, mtu))
     }
 }
 
@@ -779,15 +1168,19 @@ pub fn transport(t: &QuicTuning) -> Result<quinn::TransportConfig> {
         "cubic" => { tc.congestion_controller_factory(Arc::new(CubicConfig::default())); }
         "bbr" => { tc.congestion_controller_factory(Arc::new(BbrConfig::default())); }
         "newreno" => { tc.congestion_controller_factory(Arc::new(NewRenoConfig::default())); }
-        "rate" => { tc.congestion_controller_factory(Arc::new(RateFactory(2.0, STARTUP_GAIN, 1))); }
-        // rate:<gain>[:<startup gain>[:<mode>]] (mode 0 = startup as in 6863145, for A/B)
+        "rate" => { tc.congestion_controller_factory(Arc::new(RateFactory(2.0, STARTUP_GAIN, 1, MIN_RTT_EXPIRE))); }
+        // rate:<gain>[:<startup gain>[:<mode>[:<min RTT expiry, s>]]] (mode 0 = startup as in
+        // 6863145; expiry 0 = the min RTT never expires, as before it existed; for A/B)
         s if s.starts_with("rate:") => {
             let mut it = s[5..].split(':');
             let g: f64 = it.next().unwrap_or("2").parse()?;
             let sg: f64 = it.next().map_or(Ok(STARTUP_GAIN), str::parse)?;
             let mode: u8 = it.next().map_or(Ok(1), str::parse)?;
-            if !(1.0..=8.0).contains(&g) || !(1.0..=8.0).contains(&sg) || mode > 1 { bail!("rate gains must be 1..8, mode 0 or 1"); }
-            tc.congestion_controller_factory(Arc::new(RateFactory(g, sg, mode)));
+            let exp: f64 = it.next().map_or(Ok(MIN_RTT_EXPIRE.as_secs_f64()), str::parse)?;
+            if !(1.0..=8.0).contains(&g) || !(1.0..=8.0).contains(&sg) || mode > 1 || !(0.0..=600.0).contains(&exp) {
+                bail!("rate gains must be 1..8, mode 0 or 1, expiry 0..600 s");
+            }
+            tc.congestion_controller_factory(Arc::new(RateFactory(g, sg, mode, Duration::from_secs_f64(exp))));
         }
         s if s.starts_with("fixed:") => {
             let w: u64 = s[6..].parse()?;
@@ -919,6 +1312,7 @@ pub fn stats_line(c: &quinn::Connection) -> String {
         s.path.rtt, s.path.cwnd, s.path.current_mtu, s.path.sent_packets, s.path.lost_packets, s.path.lost_bytes,
         s.path.congestion_events, s.udp_tx.datagrams, s.udp_tx.bytes, s.udp_rx.datagrams, s.udp_rx.bytes,
         s.frame_tx.datagram, s.frame_rx.datagram, c.max_datagram_size()
-    ) + &rate_shared(c).map_or(String::new(), |r| format!(" bw={} win={} minrtt_us={}",
-        r.bw.load(Ordering::Relaxed) * 8, r.window.load(Ordering::Relaxed), r.min_rtt_us.load(Ordering::Relaxed)))
+    ) + &rate_shared(c).map_or(String::new(), |r| format!(" bw={} win={} minrtt_us={} drains={} raises={}",
+        r.bw.load(Ordering::Relaxed) * 8, r.window.load(Ordering::Relaxed), r.min_rtt_us.load(Ordering::Relaxed),
+        r.drains.load(Ordering::Relaxed), r.raises.load(Ordering::Relaxed)))
 }

@@ -35,6 +35,8 @@ tun = { version = "0.7.22", features = ["async"] }
 clap = { version = "4", features = ["derive", "env"], optional = true }
 anyhow = "1"
 socket2 = "0.5"
+# The same ring as rustls/quinn use (no new crate): the server's persistent stateless-reset key.
+ring = "0.17"
 libc = "0.2"
 sha2 = "0.10"
 hex = "0.4"

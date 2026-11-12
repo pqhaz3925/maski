@@ -200,6 +200,11 @@ enum Cmd {
         /// After an outage, migrate once more this long after traffic resumes (0 = off).
         #[arg(long, default_value_t = 0)]
         remigrate_ms: u64,
+        /// recover=migrate: after this long with nothing received (and moves done), also race
+        /// fresh connections; the old one is kept and wins if it answers first (0 = off). For a
+        /// server that restarted without its old keys.
+        #[arg(long, default_value_t = 5000)]
+        race_ms: u64,
         /// Do not open migration sockets with a short throw-away datagram (see net::send_primer).
         #[arg(long)]
         no_primer: bool,
@@ -244,10 +249,10 @@ fn main() -> anyhow::Result<()> {
                     tuning: tuning.q() }).await
             }
             Cmd::Client { server, sni, interface, pin, user, pass, path, tun_mtu, route, tun_peer, dead_ms, stats_secs,
-                send_wait, recover, attempt_ms, remigrate_ms, no_primer, alt_interface, exit_after_secs, threads: _, tuning } => {
+                send_wait, recover, attempt_ms, remigrate_ms, race_ms, no_primer, alt_interface, exit_after_secs, threads: _, tuning } => {
                 let h = client::start(client::ClientOpts { server, sni, interface, pin, user, pass, path,
                     tuning: tuning.q(), dead_ms, stats_secs, send_wait, recover: recover.clone(), attempt_ms, remigrate_ms, first_attempts: 30,
-                    primer: !no_primer, alternates: alt_interface }).await?;
+                    primer: !no_primer, alternates: alt_interface, race_ms }).await?;
                 let addr = h.addr();
                 let (rnet, rprefix) = tunio::parse_cidr(&route)?;
                 let peer = tun_peer.unwrap_or_else(|| Ipv4Addr::from(u32::from(rnet) + 1));

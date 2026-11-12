@@ -95,6 +95,9 @@ struct Config {
     recover: String,
     #[serde(default = "d_attempt")]
     attempt_ms: u64,
+    /// See `ClientOpts::race_ms` (0 = off).
+    #[serde(default = "d_race")]
+    race_ms: u64,
     #[serde(default = "d_idle")]
     idle_timeout_ms: u64,
     #[serde(default = "d_mtu")]
@@ -130,6 +133,7 @@ fn d_dead() -> u64 { 1500 }
 fn d_remigrate() -> u64 { 200 }
 fn d_recover() -> String { "migrate".into() }
 fn d_attempt() -> u64 { 1000 }
+fn d_race() -> u64 { 5000 }
 fn d_idle() -> u64 { 30000 }
 fn d_mtu() -> u16 { 1400 }
 fn d_mtu_upper() -> u16 { 1432 }
@@ -178,6 +182,7 @@ impl Config {
             first_attempts: 30,
             primer: self.primer,
             alternates: vec![],
+            race_ms: self.race_ms,
         }, self.tun_mtu))
     }
 }
