@@ -1,0 +1,55 @@
+# Networks whose addresses the «Российские сайты напрямую» list must never send direct, by origin AS
+# (tools/ru_list.py). Every prefix these ASes announce (RIS whois dump) is kept out of the supernets,
+# as the named lists of geoip.dat are; addresses inside geoip:ru itself stay direct as before.
+# One AS per line, `#` comments. Why each is here:
+#   curtain = from the home line, TCP to it stops at ~16 KB unless the SNI is on the white list
+#             (measured 2026-10-12 .. 2026-11-09, see the owner's VPN notes); direct it breaks,
+#             through the tunnel it works;
+#   cloud   = large foreign cloud / CDN: sites behind it are what a Russian user wants masked, and
+#             the big ones are throttled or curtained too.
+
+# curtain (measured)
+24940    # Hetzner
+213230   # Hetzner Cloud
+212317   # Hetzner Online (Finland / US)
+16276    # OVH
+35540    # OVH (FR)
+14061    # DigitalOcean
+12876    # Scaleway
+31898    # Oracle Cloud
+9009     # M247
+60068    # Datacamp / CDN77
+20473    # Vultr (The Constant Company)
+63949    # Linode / Akamai Connected Cloud
+63023    # GTHost
+62563    # GTHost (Globaltelehost)
+36352    # ColoCrossing
+51765    # Crea Nova
+
+# cloud / CDN
+16509    # Amazon (EC2)
+14618    # Amazon (us-east)
+8987     # Amazon (EU)
+15169    # Google
+396982   # Google Cloud
+19527    # Google
+36040    # YouTube
+43515    # YouTube
+8075     # Microsoft
+8068     # Microsoft
+12076    # Microsoft
+20940    # Akamai
+16625    # Akamai
+13335    # Cloudflare
+209242   # Cloudflare (Spectrum / WARP)
+54113    # Fastly
+51167    # Contabo
+32934    # Facebook / Meta
+63293    # Facebook
+13414    # Twitter / X
+35995    # Twitter / X
+62041    # Telegram
+59930    # Telegram
+44907    # Telegram
+211157   # Telegram
+2906     # Netflix

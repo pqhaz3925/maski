@@ -1,0 +1,92 @@
+# XcodeGen spec: `xcodegen` in this directory generates Maski.xcodeproj (git-ignored).
+# Build the Rust library first: ../tools/build-apple.sh (target/aarch64-apple-ios/apple/libmaski.a).
+# Device only (the library has no simulator slice).
+name: Maski
+options:
+  bundleIdPrefix: org.example
+  deploymentTarget:
+    iOS: "26.0"
+settings:
+  base:
+    SWIFT_VERSION: "5.9"
+    DEVELOPMENT_TEAM: YOURTEAMID
+    CODE_SIGN_STYLE: Automatic
+    MARKETING_VERSION: "0.1"
+    CURRENT_PROJECT_VERSION: "1"
+
+targets:
+  MaskiApp:
+    type: application
+    platform: iOS
+    sources:
+      - path: App
+        excludes: [Info.plist]
+      - path: Shared
+      # Git-ignored: {"server","pin","user","pass"} (see README.md); seeds the first profile.
+      - path: Config/server.json
+        buildPhase: resources
+        optional: true
+    info:
+      path: App/Info.plist
+      properties:
+        CFBundleDisplayName: maski
+        CFBundleDevelopmentRegion: ru
+        MaskiKeychainGroup: $(AppIdentifierPrefix)org.example.maski.shared
+        NSCameraUsageDescription: QR профиля
+        CFBundleShortVersionString: $(MARKETING_VERSION)
+        CFBundleVersion: $(CURRENT_PROJECT_VERSION)
+        UILaunchScreen: {}
+        UISupportedInterfaceOrientations: [UIInterfaceOrientationPortrait]
+        # Profile links maski://add?... and test drivers maski://test/<command>?<args> (README.md).
+        CFBundleURLTypes:
+          - CFBundleURLName: org.example.maski
+            CFBundleURLSchemes: [maski]
+        UIFileSharingEnabled: true
+    entitlements:
+      path: App/App.entitlements
+      properties:
+        com.apple.developer.networking.networkextension: [packet-tunnel-provider]
+        com.apple.security.application-groups: [group.org.example.maski]
+        keychain-access-groups: [$(AppIdentifierPrefix)org.example.maski.shared]
+    dependencies:
+      - target: MaskiTunnel
+        embed: true
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: org.example.maski
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+        OTHER_LDFLAGS: [-framework, Security]
+
+  MaskiTunnel:
+    type: app-extension
+    platform: iOS
+    sources:
+      - path: Tunnel
+        excludes: [Info.plist, ru4.txt]
+      - path: Shared
+      # Russian IPv4 prefixes from xray's geoip.dat (tools/geoip_ru.py, README.md).
+      - path: Tunnel/ru4.txt
+        buildPhase: resources
+    info:
+      path: Tunnel/Info.plist
+      properties:
+        CFBundleDisplayName: maski Tunnel
+        MaskiKeychainGroup: $(AppIdentifierPrefix)org.example.maski.shared
+        CFBundleShortVersionString: $(MARKETING_VERSION)
+        CFBundleVersion: $(CURRENT_PROJECT_VERSION)
+        NSExtension:
+          NSExtensionPointIdentifier: com.apple.networkextension.packet-tunnel
+          NSExtensionPrincipalClass: $(PRODUCT_MODULE_NAME).PacketTunnelProvider
+    entitlements:
+      path: Tunnel/Tunnel.entitlements
+      properties:
+        com.apple.developer.networking.networkextension: [packet-tunnel-provider]
+        com.apple.security.application-groups: [group.org.example.maski]
+        keychain-access-groups: [$(AppIdentifierPrefix)org.example.maski.shared]
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: org.example.maski.tunnel
+        SWIFT_OBJC_BRIDGING_HEADER: Tunnel/Bridging.h
+        HEADER_SEARCH_PATHS: $(SRCROOT)/../include
+        LIBRARY_SEARCH_PATHS: $(SRCROOT)/../target/aarch64-apple-ios/apple
+        OTHER_LDFLAGS: [-lmaski, -framework, Security, -framework, CoreTelephony]

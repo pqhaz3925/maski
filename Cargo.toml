@@ -1,0 +1,66 @@
+[package]
+name = "maski"
+version = "0.1.0"
+edition = "2021"
+license = "AGPL-3.0-only"
+
+[lib]
+name = "maski"
+path = "src/lib.rs"
+# Apple static library: `tools/build-apple.sh` (cargo rustc --crate-type staticlib).
+
+[[bin]]
+name = "maski"
+path = "src/main.rs"
+required-features = ["cli"]
+
+[features]
+default = ["cli"]
+# Command line tool: server, probe, TUN creation, logging setup.
+cli = ["dep:clap", "dep:rcgen", "dep:tracing-subscriber"]
+# C API for an Apple Network Extension (include/maski.h).
+ffi = ["dep:serde", "dep:serde_json", "dep:cbindgen", "dep:tracing-subscriber"]
+
+[dependencies]
+quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-ring", "log"] }
+quinn-proto = { version = "0.11.19", default-features = false }
+h3 = "0.0.8"
+h3-quinn = "0.0.10"
+http = "1"
+bytes = "1"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "logging", "tls12"] }
+rcgen = { version = "0.13", optional = true }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "signal", "sync", "io-util"] }
+tun = { version = "0.7.22", features = ["async"] }
+clap = { version = "4", features = ["derive", "env"], optional = true }
+anyhow = "1"
+socket2 = "0.5"
+libc = "0.2"
+sha2 = "0.10"
+hex = "0.4"
+base64 = "0.22"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"], optional = true }
+serde = { version = "1", features = ["derive"], optional = true }
+serde_json = { version = "1", optional = true }
+
+[build-dependencies]
+cbindgen = { version = "0.28", optional = true, default-features = false }
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+debug = 1
+
+[patch.crates-io]
+h3 = { path = "vendor/h3" }
+
+# Apple Network Extension library: small, and a panic must never unwind into Swift.
+[profile.apple]
+inherits = "release"
+opt-level = "s"
+lto = "fat"
+panic = "abort"
+debug = 0
+strip = "debuginfo"
