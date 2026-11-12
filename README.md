@@ -1,115 +1,115 @@
 # maski
 
-**maski** — L3-VPN на стандартном MASQUE: CONNECT-IP ([RFC 9484](https://www.rfc-editor.org/rfc/rfc9484)) поверх HTTP/3, IP-пакеты из TUN едут в QUIC-датаграммах. Ядро на Rust (quinn), сервер под Linux, клиент для командной строки (Linux, macOS) и приложение для iOS.
+**maski** is an L3 VPN over standard MASQUE: CONNECT-IP ([RFC 9484](https://www.rfc-editor.org/rfc/rfc9484)) over HTTP/3, with IP packets from a TUN device carried in QUIC DATAGRAMs. The core is written in Rust (quinn). There is a Linux server, a command-line client (Linux, macOS) and an iOS app.
 
-*An L3 VPN over standard MASQUE (CONNECT-IP over HTTP/3, IP packets in QUIC DATAGRAMs): Rust core, Linux server, CLI client, iOS app. The README is in Russian; the code and its comments are in English.*
+[Русская версия](README.ru.md)
 
-Сделан для себя и друзей, чтобы один и тот же туннель работал и на домашней линии, и на телефоне в мобильной сети, где связь постоянно пропадает и меняется. Только UDP/QUIC, никакого TCP снаружи.
+It was built for personal use and for friends, so that the same tunnel works on a home line and on a phone in a mobile network where connectivity keeps dropping and changing. UDP/QUIC only, no TCP on the outside.
 
-> Состояние: рабочий личный проект, которому несколько дней. Аудита безопасности не было, формат настроек и флаги ещё меняются.
+> Status: a working personal project that is a few days old. It has had no security audit, and the configuration format and flags still change.
 
-## Чем отличается
+## What is different
 
-- **Настоящий L3.** В туннеле идут IP-пакеты, а не потоки прокси: внутри нет пользовательского TCP-стека, потери и перегрузку разбирает TCP самих приложений.
-- **Переживает смену сети.** Клиент замечает молчащий путь за 0,7–1,5 с и переезжает на новый сокет без нового рукопожатия; сервер придерживает трафик, пока клиент молчит. Если Wi-Fi жив, но не отвечает, клиент уходит на сотовую и возвращается, когда Wi-Fi снова проходит проверку.
-- **Быстрое переподключение.** Когда соединение всё-таки умерло, новые рукопожатия стартуют каждую секунду на свежих сокетах, побеждает первое завершившееся.
-- **Свой контроль перегрузки.** Окно считается из измеренной скорости доставки и минимальной задержки и не реагирует на случайные потери; очередь датаграмм чистится по времени ожидания (цель 30 мс), чтобы слабый аплинк не превращался в секунды задержки.
-- **Проходит фильтр первого пакета.** На трёх мобильных операторах из трёх новый UDP-поток режется, если первый пакет «слишком случайный» и попадает в определённый размер (подробнее ниже). maski подбирает начальный идентификатор соединения с малым числом единичных бит, а на каждом новом сокете первой шлёт короткую пустышку.
-- **Маленький.** Расширение туннеля на iPhone занимает 3,4–5,1 МБ при лимите iOS около 50 МБ.
+- **Real L3.** The tunnel carries IP packets, not proxy streams. There is no userspace TCP stack inside; loss and congestion are handled by the applications' own TCP.
+- **Survives network changes.** The client notices a silent path within 0.7–1.5 s and moves to a new socket without a new handshake; the server holds traffic back while the client is silent. If Wi-Fi is up but not answering, the client moves to cellular and returns once Wi-Fi passes a check again.
+- **Fast reconnect.** When the connection does die, a new handshake starts every second on a fresh socket, and the first one to finish wins.
+- **Its own congestion control.** The window comes from the measured delivery rate and the minimum delay and does not react to random loss. The datagram queue is trimmed by waiting time (target 30 ms), so a weak uplink does not turn into seconds of latency.
+- **Gets past the first-packet filter.** On three mobile operators out of three, a new UDP flow is cut if its first packet looks "too random" and falls into a certain size (details below). maski picks an initial connection ID with few one-bits and sends a short dummy datagram first on every new socket.
+- **Small.** The tunnel extension on an iPhone takes 3.4–5.1 MB against an iOS limit of about 50 MB.
 
-## Что есть
+## What is included
 
-**Сервер** (Linux): несколько пользователей, у каждого при желании постоянный адрес в туннеле; самоподписанный сертификат и проверка по отпечатку SHA-256 на клиенте.
+**Server** (Linux): several users, each with an optional fixed tunnel address; a self-signed certificate checked on the client by its SHA-256 fingerprint.
 
-**Клиент CLI** (Linux, macOS): привязка к интерфейсу и запасной интерфейс.
+**CLI client** (Linux, macOS): binding to an interface and a fallback interface.
 
-**Приложение iOS** (iOS 26+, SwiftUI, Packet Tunnel):
-- «Держать надетой» (On Demand) и «Сотовая при сбое Wi-Fi»;
-- «Российские сайты напрямую» — 10 000 маршрутов мимо туннеля, список собирается скриптом из `geoip.dat`;
-- «Локальная сеть напрямую», свои подсети мимо туннеля, «Снимать в сетях» по имени Wi-Fi;
-- график задержки со сменами сети, журнал и логи, которые переживают выгрузку приложения;
-- профиль добавляется ссылкой `maski://add?…` или QR-кодом.
+**iOS app** (iOS 26+, SwiftUI, Packet Tunnel). The interface is in Russian:
+- keep-connected (On Demand) and "cellular when Wi-Fi fails";
+- "Russian sites direct": 10,000 routes that bypass the tunnel, with the list built by a script from `geoip.dat`;
+- local network direct, custom subnets that bypass the tunnel, and auto-disconnect on chosen Wi-Fi networks;
+- a latency chart with network changes marked, and a journal and logs that survive the app being killed;
+- a profile is added by a `maski://add?…` link or a QR code.
 
-Приложение для macOS в работе и в этот репозиторий пока не входит. IPv6 внутри туннеля нет.
+A macOS app is in progress and is not in this repository yet. There is no IPv6 inside the tunnel.
 
-## Замеры
+## Measurements
 
-Всё ниже — наши собственные замеры в ноябре 2026 года: клиент в России, сервер на VPS во Франкфурте. Операторы обезличены. Почти везде прогонов мало (число указано), так что это порядок величин, а не бенчмарк.
+Everything below is our own measurement from November 2026: the client is in Russia, the server is a VPS in Frankfurt. Operators are anonymized. Most rows have few runs (the count is given), so treat the numbers as an order of magnitude, not a benchmark.
 
-### Скорость
+### Throughput
 
-Один TCP-поток внутри туннеля против того же потока без туннеля, Мбит/с:
+One TCP stream inside the tunnel against the same stream without it, Mbit/s:
 
-| Линия | Вниз, туннель / без | Вверх, туннель / без | Прогонов |
+| Line | Down, tunnel / bare | Up, tunnel / bare | Runs |
 |---|---|---|---|
-| Домашняя проводная, Mac | 216–244 / 270–301 | 229–308 / — | 3 по 8 с |
-| LTE, оператор А, модем | 53,5 / 58,8 | 16,5 / 13,3 | 1 |
-| LTE, оператор Б (SIM в роуминге, трафик выходит через домашнюю сеть оператора), модем | 37,6 / 47,5 | 10,9 / 13,3 | 1 |
-| LTE, оператор В, модем | 52,9 / 53,3 | 15,0 / 15,0 | медиана 3 пар |
-| LTE, оператор А, iPhone, только вверх | — | отношение 1,16 | медиана 5 пар |
+| Home wired line, Mac | 216–244 / 270–301 | 229–308 / — | 3 × 8 s |
+| LTE, operator A, modem | 53.5 / 58.8 | 16.5 / 13.3 | 1 |
+| LTE, operator B (roaming SIM, traffic exits through the operator's home network), modem | 37.6 / 47.5 | 10.9 / 13.3 | 1 |
+| LTE, operator C, modem | 52.9 / 53.3 | 15.0 / 15.0 | median of 3 pairs |
+| LTE, operator A, iPhone, upload only | — | ratio 1.16 | median of 5 pairs |
 
-- По Wi-Fi на iPhone вниз выходит около 200–250 Мбит/с. Вверх туннель упирается в 76–144 Мбит/с при 165–169 без него — причина пока не найдена.
-- Одно соединение на операторе В прокачало 1,92 ГБ за 9 минут без обрыва и без замедления по объёму.
+- On iPhone Wi-Fi, download reaches about 200–250 Mbit/s. Upload through the tunnel tops out at 76–144 Mbit/s against 165–169 without it; the cause is not found yet.
+- One connection on operator C moved 1.92 GB in 9 minutes with no cut and no slowdown by volume.
 
-### Смена сети и обрывы
+### Network changes and outages
 
-| Что | Результат | Прогонов |
+| What | Result | Runs |
 |---|---|---|
-| Модем: 25 переключений LTE ↔ 3G и между диапазонами, адрес каждый раз новый | туннель оживал вместе с радио; лишняя пауза была один раз, 1,1 с; длинное TCP-соединение внутри пережило всё | 5 проходов |
-| iPhone: Wi-Fi перестал отвечать, уход на сотовую | пауза пинга 1,5–1,9 с, сама iOS переключалась 6–8 с | 5 |
-| iPhone: сотовая → Wi-Fi | без паузы | 1 проход |
-| iPhone: 35 с без сети, соединение умерло | связь через 0,78–0,84 с после возврата сети | 2 |
-| Модем: радио выключено на 4 с | связь через 2,6–3,4 с после возврата радио | 6 |
-| Принудительное переподключение, три оператора | 0,23–0,29 с | по 3 |
-| iPhone: подключение | 0,42–0,54 с; со списком российских маршрутов первый трафик через 1,4–1,5 с | 3–6 |
-| iPhone: экран заблокирован 5 минут, сотовая | соединение выжило, около 15 КиБ в минуту в каждую сторону | 2 |
+| Modem: 25 switches LTE ↔ 3G and between bands, a new address every time | the tunnel came back together with the radio; an extra pause happened once, 1.1 s; a long TCP connection inside survived everything | 5 passes |
+| iPhone: Wi-Fi stopped answering, move to cellular | ping gap 1.5–1.9 s; iOS on its own took 6–8 s | 5 |
+| iPhone: cellular → Wi-Fi | no gap | 1 pass |
+| iPhone: 35 s without network, connection dead | back 0.78–0.84 s after the network returned | 2 |
+| Modem: radio off for 4 s | back 2.6–3.4 s after the radio returned | 6 |
+| Forced reconnect, three operators | 0.23–0.29 s | 3 each |
+| iPhone: connect | 0.42–0.54 s; with the Russian route list, first traffic after 1.4–1.5 s | 3–6 |
+| iPhone: screen locked for 5 minutes, cellular | the connection survived, about 15 KiB per minute each way | 2 |
 
-### Фильтр первого пакета
+### The first-packet filter
 
-На всех трёх операторах новый UDP-поток обрывается после 2–3 пакетов, если в первой датаграмме одновременно много единичных бит в первых 16 байтах и размер попадает в один из двух диапазонов. У QUIC первые байты — это заголовок и случайный идентификатор соединения, а первый пакет quinn весит 1400 байт, так что без обхода часть соединений не устанавливается.
+On all three operators a new UDP flow is cut after 2–3 packets if its first datagram has many one-bits in the first 16 bytes and, at the same time, its size falls into one of two ranges. In QUIC the first bytes are the header and a random connection ID, and quinn's first packet is 1400 bytes, so without a workaround part of the connections never come up.
 
-| Первый пакет QUIC | Установилось соединений |
+| First QUIC packet | Connections established |
 |---|---|
-| случайный идентификатор, как у обычного quinn | 8 из 12 (два оператора) |
-| идентификатор с большим числом единичных бит | 0 из 18 |
-| то же, но перед ним короткая пустышка | 15 из 18 |
-| идентификатор с малым числом единичных бит (maski по умолчанию) | 36 из 36 |
+| random connection ID, as in stock quinn | 8 of 12 (two operators) |
+| connection ID with many one-bits | 0 of 18 |
+| the same, with a short dummy datagram before it | 15 of 18 |
+| connection ID with few one-bits (maski's default) | 36 of 36 |
 
-Остальное у трёх операторов одинаково: адрес за CGNAT, привязка NAT в тишине жива 120 с и пропадает к 240 с, обрывов длинного потока нет.
+The rest is the same on the three operators: the address is behind CGNAT, an idle NAT binding is alive at 120 s and gone by 240 s, and a long flow is not cut.
 
-## Сравнение с xray MASQUE
+## Comparison with xray MASQUE
 
-Xray-core 26.11.9, вход и выход `masque`, тот же сервер и те же линии, 10 ноября 2026 года. Сравнение не строгое: xray — прокси, а не L3-туннель; замеры делались в разные часы и большей частью по одному разу; maski здесь — ранняя сборка того же дня.
+Xray-core 26.11.9, `masque` inbound and outbound, the same server and the same lines, 10 November 2026. The comparison is not rigorous: xray is a proxy, not an L3 tunnel; the runs were at different hours and mostly single; maski here is an early build from the same day.
 
 | | xray MASQUE | maski |
 |---|---|---|
-| Домашняя линия, один TCP-поток | 26–31 Мбит/с | 216–244 Мбит/с |
-| То же через второй адрес сервера (за GRE) | 4–52 Мбит/с | 267–290 Мбит/с |
-| Домашняя линия, четыре потока в сумме | 120 Мбит/с | не мерили |
-| LTE, оператор А, один поток | 16,1 Мбит/с | 26,2 Мбит/с |
-| Смена сети на модеме: лишняя пауза после возврата радио | 30,7–33,9 с в 5 случаях из 7 | 0 с в 24 из 25, один раз 1,1 с |
-| То же с `quicParams` (`maxIdleTimeout` 4, `keepAlivePeriod` 2) | 0–1,4 с в 8 из 8 | — |
-| Новые соединения под фильтром первого пакета, оператор А | 20 из 20 | 36 из 36 на трёх операторах |
+| Home line, one TCP stream | 26–31 Mbit/s | 216–244 Mbit/s |
+| The same through the server's second address (behind GRE) | 4–52 Mbit/s | 267–290 Mbit/s |
+| Home line, four streams in total | 120 Mbit/s | not measured |
+| LTE, operator A, one stream | 16.1 Mbit/s | 26.2 Mbit/s |
+| Network change on the modem: extra pause after the radio is back | 30.7–33.9 s in 5 of 7 cases | 0 s in 24 of 25, once 1.1 s |
+| The same with `quicParams` (`maxIdleTimeout` 4, `keepAlivePeriod` 2) | 0–1.4 s in 8 of 8 | — |
+| New connections under the first-packet filter, operator A | 20 of 20 | 36 of 36 on three operators |
 
-- В xray скорость на поток упирается в окно пользовательского TCP-стека и растёт с числом потоков; у maski TCP остаётся за приложением.
-- По умолчанию соединение xray не переживает смену адреса и ждёт своего таймаута простоя; двумя параметрами клиента это лечится, как видно из таблицы.
-- Первый пакет quic-go весит 1350 байт и в диапазоны фильтра не попадает, поэтому xray проходит без специальных мер.
-- **Совместимость:** клиент maski подключался к входу `masque` xray, а выход `masque` xray — к серверу maski. Проверено на ранней сборке, на текущей не перепроверялось.
+- In xray, per-stream speed is limited by the window of its userspace TCP stack and grows with the number of streams; in maski, TCP stays with the application.
+- By default an xray connection does not survive an address change and waits for its idle timeout; two client parameters fix that, as the table shows.
+- quic-go's first packet is 1350 bytes and falls outside the filter's size ranges, so xray gets through with no special measures.
+- **Interoperability:** the maski client connected to xray's `masque` inbound, and xray's `masque` outbound connected to the maski server. This was checked on an early build and not re-checked on the current one.
 
-## Сборка и запуск
+## Build and run
 
-Нужен Rust. Сервер и клиент — один бинарник:
+You need Rust. The server and the client are one binary:
 
 ```bash
 cargo build --release
 ```
 
-**Сервер** (Linux, от root):
+**Server** (Linux, as root):
 
 ```bash
 cat > users <<'EOF'
-# имя    пароль    [постоянный адрес]
-admin    s3cret    10.90.0.2
+# name   password   [fixed address]
+admin    s3cret     10.90.0.2
 friend   other-secret
 EOF
 
@@ -117,45 +117,45 @@ maski server --listen 0.0.0.0:8445 --tun maski0 --addr 10.90.0.1/24 --mtu 1400 \
   --users users --cert-dir cert
 ```
 
-При старте сервер создаёт сертификат в `cert/` и пишет в лог строку `certificate sha256 …` — это отпечаток для клиента. Выход в интернет настраивается отдельно: `net.ipv4.ip_forward=1` и masquerade для подсети туннеля.
+On start the server creates a certificate in `cert/` and logs a line `certificate sha256 …`; that is the fingerprint for the client. Internet access is set up separately: `net.ipv4.ip_forward=1` and masquerade for the tunnel subnet.
 
-**Клиент** (от root, создаёт TUN):
+**Client** (as root, it creates the TUN device):
 
 ```bash
 MASKI_PASS=s3cret maski client --server 203.0.113.10:8445 --pin <sha256> --user admin \
   --sni your.domain.example --interface en0
 ```
 
-Клиент поднимает TUN и один маршрут в него (`--route`, по умолчанию подсеть туннеля). Остальной трафик заворачивается в этот интерфейс обычными маршрутами системы; приложение на iOS делает это само.
+The client brings up the TUN device and one route into it (`--route`, the tunnel subnet by default). The rest of the traffic is sent into that interface with ordinary system routes; the iOS app does this itself.
 
-Проверить новые соединения без TUN и без root: `maski probe --help`. Все флаги — в `maski server --help` и `maski client --help`.
+To test new connections without a TUN device and without root, see `maski probe --help`. All flags are in `maski server --help` and `maski client --help`.
 
-**SNI.** Имя в TLS видно на проводе. Значения по умолчанию в коде — заглушки; задайте свои `--sni` и `--cert-name`, иначе все установки будут выглядеть одинаково.
+**SNI.** The TLS server name is visible on the wire. The defaults in the code are placeholders; set your own `--sni` and `--cert-name`, otherwise every installation looks the same.
 
-**iOS.** Нужны Xcode, [xcodegen](https://github.com/yonaskolb/XcodeGen) и своя команда разработчика Apple: в `ios/project.yml` замените `YOURTEAMID` и префикс `org.example`. Дальше `tools/build-apple.sh` и `ios/build.sh <udid>`; подробности в [`ios/README.md`](ios/README.md).
+**iOS.** You need Xcode, [xcodegen](https://github.com/yonaskolb/XcodeGen) and your own Apple developer team: replace `YOURTEAMID` and the `org.example` prefix in `ios/project.yml`. Then run `tools/build-apple.sh` and `ios/build.sh <udid>`; details are in [`ios/README.md`](ios/README.md).
 
-## Как устроено
+## Layout
 
-| Файл | Что там |
+| File | What is there |
 |---|---|
-| `src/proto.rs` | капсулы и формат CONNECT-IP |
-| `src/net.rs` | сокеты, настройки QUIC, контроллер скорости, очередь датаграмм |
-| `src/client.rs` | клиент: слежение за путём, переезды, запасной интерфейс, переподключение |
-| `src/server.rs`, `src/users.rs` | сервер, пользователи и адреса |
-| `src/tls.rs` | сертификат и проверка по отпечатку |
-| `src/ffi.rs`, `include/maski.h` | C API для расширения туннеля |
-| `ios/` | приложение и расширение Packet Tunnel |
-| `tools/ru_list.py` | сборка и проверка списка российских маршрутов |
-| `vendor/h3` | [h3](https://github.com/hyperium/h3) с одной правкой: значение `:protocol` `connect-ip` |
+| `src/proto.rs` | CONNECT-IP capsules and wire format |
+| `src/net.rs` | sockets, QUIC settings, the rate controller, the datagram queue |
+| `src/client.rs` | client: path watching, moves to a new socket, fallback interface, reconnect |
+| `src/server.rs`, `src/users.rs` | server, users and addresses |
+| `src/tls.rs` | certificate and fingerprint check |
+| `src/ffi.rs`, `include/maski.h` | C API for the tunnel extension |
+| `ios/` | the app and the Packet Tunnel extension |
+| `tools/ru_list.py` | builds and checks the Russian route list |
+| `vendor/h3` | [h3](https://github.com/hyperium/h3) with one change: the `:protocol` value `connect-ip` |
 
-## Что известно и не починено
+## Known and not fixed
 
-- Потолок аплоада по Wi-Fi через туннель на iPhone.
-- После обрыва первый пакет на новом сокете большой и попадает под фильтр; защищает только пустышка, а она промахивается примерно раз из десяти. Тогда клиент переезжает ещё раз.
-- На медленной линии (задержка от 400 мс) переподключение занимает 2–3 с.
-- На iOS нельзя исключать из туннеля отдельные приложения — только адреса и подсети.
-- Скрипты замеров и лабораторный стенд в репозиторий не входят.
+- The Wi-Fi upload ceiling through the tunnel on iPhone.
+- After an outage, the first packet on a new socket is large and falls under the filter; only the dummy datagram protects it, and it misses about once in ten. The client then moves again.
+- On a slow line (delay of 400 ms and more), reconnecting takes 2–3 s.
+- iOS cannot exclude individual apps from the tunnel, only addresses and subnets.
+- The measurement scripts and the lab setup are not in this repository.
 
-## Лицензия
+## License
 
-GNU AGPL версии 3, см. [LICENSE](LICENSE). `vendor/h3` — MIT, авторы h3 (см. `vendor/h3/LICENSE`).
+GNU AGPL version 3, see [LICENSE](LICENSE). `vendor/h3` is MIT, by the h3 authors (see `vendor/h3/LICENSE`).
